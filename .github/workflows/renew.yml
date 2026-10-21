@@ -3,7 +3,7 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 23 * * 3' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+    - cron: '00 17 * * 3' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
 
 permissions:
   contents: write
@@ -67,7 +67,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No need to commit"
           else
-            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=America/Caracas date +'%Y-%m-%d %H:%M:%S')"
             git push origin main
           fi
       
