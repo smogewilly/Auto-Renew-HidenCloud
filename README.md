@@ -43,6 +43,10 @@
 3. Actions菜单里手动触发 `workflow_dispatch`  
 4. 根据服务到期时间来修改cron运行时间,比如你的服务是25号到期,计算后是星期二,则设置cron为每周一运行
 
+### Failure diagnostics
+
+If renewal fails, download the `renewal-debug` artifact from the failed Actions run to inspect the screenshots, including `renew_modal_failed.png`. Review screenshots for private account information before sharing them.
+
 
 ---
 
