@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os,re,sys,time,random,requests,urllib.parse
 try:
     from patchright.sync_api import sync_playwright
     USING_PATCHRIGHT = True
@@ -10,14 +10,17 @@ except ImportError:
     USING_PATCHRIGHT = False
 
 # --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 必填
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 必填
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选    
+# Note: HidenCloud enforces Discord OAuth for free-service renewals;
+# remember_web cookie and email/password sessions are rejected on Create Invoice.
+EMAIL         = os.environ.get('EMAIL') or ""            # Optional, used for Telegram notification
+REGION        = os.environ.get('REGION') or "🎉"         # Optional region/emoji prefix for Telegram notification
+DISCORD_TOKEN = (os.environ.get('DISCORD_TOKEN') or "").strip().strip('"').strip("'")
+TG_CHAT_ID    = os.environ.get('TG_CHAT_ID') or ""       # Optional Telegram Chat ID
+TG_BOT_TOKEN  = os.environ.get('TG_BOT_TOKEN') or ""     # Optional Telegram Bot Token
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
+DISCORD_OAUTH_LOGIN_URL = f"{BASE_URL}/oauth/discord/login"
 
 # --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
 IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
@@ -58,7 +61,7 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+def send_telegram_notification(status, old_due="未知", new_due="未知", current_ip="未知"):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
@@ -73,11 +76,13 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
             masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
         else:
             masked_email = f"{name}@{domain}"
-    else:
+    elif EMAIL:
         masked_email = EMAIL[:2] + '****'
+    else:
+        masked_email = "未配置"
 
     text = (
-        f"🎉 HidenCloud 续期通知\n\n"
+        f"{REGION} HidenCloud 续期通知\n\n"
         f"{status}\n"
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
@@ -194,7 +199,7 @@ def _click_cf_checkbox(page, frame_el=None):
     except Exception:
         return False
 
-SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required', 'checking your browser', '请稍候', 'please wait', 'one more step')
+SECURITY_TITLE_HINTS = ('security verification', 'just a moment', 'attention required', 'checking your browser', '请稍候', 'please wait', 'one more step', 'protection enabled')
 
 def _is_security_check_page(page):
     try:
@@ -209,7 +214,8 @@ def _is_security_check_page(page):
             () => {
                 const t = document.body ? document.body.innerText.slice(0, 5000).toLowerCase() : '';
                 return t.includes('verify you are human') || t.includes('checking your browser')
-                    || t.includes('security verification');
+                    || t.includes('security verification')
+                    || t.includes('verifying the security of your connection');
             }
             """
         )
@@ -388,109 +394,162 @@ def open_browser(p):
     page.add_init_script(STEALTH_JS)
     return browser, page
 
-def _is_logged_in(page):
-    """是否真正处于登录后的控制台状态（防止把官网首页/验证页/登录页误判为登录成功）"""
+def _is_logged_in(page, strict=False):
+    """是否真正处于登录后的控制台状态（防止把官网首页/验证页/登录页误判为登录成功）
+    strict=True 时额外校验页面内容：必须无登录表单特征，且包含控制台特征"""
     try:
         url = page.url or ''
         if 'dash.hidencloud.com' not in url:
             return False
         if 'auth/login' in url or _is_security_check_page(page):
             return False
+        if strict:
+            try:
+                body = (page.locator("body").inner_text(timeout=8000) or "").lower()
+            except Exception:
+                return False
+            login_markers = ('sign in to your account', 'email or username', 'forgot password',
+                             'sign in with discord', 'sign in with google')
+            if any(m in body for m in login_markers):
+                return False
+            console_markers = ('dashboard', 'invoices', 'balance', 'tickets', 'your services', 'notifications')
+            if not any(m in body for m in console_markers):
+                return False
         return True
     except Exception:
         return False
 
-def login(page):
-    # 1. Cookie 登录尝试
-    if COOKIE_VALUE:
-        log("📇 尝试 Cookie 登录...")
-        try:
-            page.context.add_cookies([{
-                'name': 'remember_web_59ba36addc2b2f9401580f014c7f58ea4e30989d',
-                'value': COOKIE_VALUE,
-                'domain': 'dash.hidencloud.com',
-                'path': '/',
-                'expires': int(time.time()) + 3600 * 24 * 365,
-                'httpOnly': True,
-                'secure': True,
-                'sameSite': 'Lax'
-            }])
-            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-            handle_cloudflare(page, timeout=240)
-            time.sleep(2)
-            handle_cloudflare(page, timeout=60)  # 跳转后可能再次出现验证页
-            if _is_logged_in(page):
-                log(f"✅ Cookie 登录成功！当前已到达dashboard页面")
-                return True
-            log("❌ Cookie 失效，请更换")
-        except Exception as e:
-            log(f"⚠️ Cookie 登录尝试异常: {e}")
+DISCORD_AUTHORIZE_JS = """
+async (cfg) => {
+    const resp = await fetch('https://discord.com/api/v9/oauth2/authorize?' + cfg.query, {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'authorization': cfg.token,
+            'x-discord-locale': 'en-US'
+        },
+        body: JSON.stringify({
+            permissions: '0',
+            authorize: true,
+            integration_type: 0,
+            location_context: { guild_id: '10000', channel_id: '10000', channel_type: 10000 }
+        })
+    });
+    let data = {};
+    try { data = await resp.json(); } catch (e) {}
+    const message = (data && (data.message || data.error_description || (data.captcha_key ? 'captcha_required' : ''))) || '';
+    return { status: resp.status, location: (data && data.location) || '', message };
+}
+"""
 
-    # 2. 账号密码登录
-    if not EMAIL or not PASSWORD:
-        return False
-    log("💣 尝试账号密码登录...")
+def _extract_authorize_query(url):
+    """Extract OAuth2 authorize query string from Discord authorize or login?redirect_to URLs."""
+    if not url:
+        return ""
     try:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page, timeout=240)
-        time.sleep(8) # 等页面完全加载
-        log("⌨️ 输入账号密码...")
-        # 真实表单字段：input[name="username"]（可填邮箱或用户名）/ input[name="password"]
-        user_input = page.locator('input[name="username"], input[name="email"], input[type="email"]').first
-        pwd_input = page.locator('input[name="password"], input[type="password"]').first
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return ""
+    if parsed.path.rstrip('/').endswith('/oauth2/authorize') and parsed.query:
+        return parsed.query
+    m = re.search(r'(?:^|&)redirect_to=([^&]+)', parsed.query or '')
+    if m:
         try:
-            user_input.wait_for(state="visible", timeout=30000)
+            target = urllib.parse.unquote(m.group(1))
+            target_parsed = urllib.parse.urlparse(target)
         except Exception:
-            handle_cloudflare(page, timeout=120)
-            user_input.wait_for(state="visible", timeout=30000)
-        user_input.fill(EMAIL, timeout=10000)
-        pwd_input.fill(PASSWORD, timeout=10000)
-        time.sleep(0.5)
-        handle_cloudflare(page, timeout=60)
-        
-        # 登录表单自带 Turnstile，提交前先等它的 token
-        if not solve_modal_turnstile(page, timeout=90):
-            log("⚠️ 登录表单的 Turnstile 未确认通过，仍将尝试提交...")
-        
-        log("🖱️ 点击登录按钮提交...")
-        time.sleep(3) # 等Turnstile完全通过
-        try:
-            page.click('button[type="submit"]', timeout=10000)
-        except Exception:
-            page.locator('button:has-text("Sign in"), button:has-text("登录")').first.click(timeout=10000)
-        time.sleep(3)
-        handle_cloudflare(page, timeout=240)
-        nav_start = time.time()
-        navigated = False
-        while time.time() - nav_start < 120:
-            try:
-                if "/auth/login" not in page.url and not _is_security_check_page(page):
-                    navigated = True
-                    break
-                if _is_security_check_page(page) or _has_interstitial_iframe(page):
-                    handle_cloudflare(page, timeout=60)
-            except Exception:
-                pass
-            time.sleep(1)
-        if not navigated:
-            log("❌ 登录提交后未能完成跳转。")
-            page.screenshot(path="login_fail.png")
-            return False
-        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page, timeout=120)
-        page_title = page.title()
-        log(f"📝 当前Title: {page_title}")
-        if not _is_logged_in(page):
-            log("❌ 登录失败。")
-            status = "❌ 登录失败"
-            send_telegram_notification(status)  # 发送 Telegram 通知 
-            return False
-        log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
-        return True
-    except Exception as e:
-        log(f"❌ 登录异常: {e}")
-        page.screenshot(path="login_fail.png")
+            return ""
+        if target_parsed.path.rstrip('/').endswith('/oauth2/authorize') and target_parsed.query:
+            return target_parsed.query
+    return ""
+
+def discord_login(page):
+    """Authenticate via HidenCloud Discord OAuth using DISCORD_TOKEN."""
+    if not DISCORD_TOKEN:
+        log("ℹ️ 未配置 DISCORD_TOKEN，跳过 Discord OAuth 登录")
         return False
+    log("🔑 尝试 Discord OAuth 登录...")
+    try:
+        if _is_logged_in(page, strict=True):
+            return True
+
+        page.goto(DISCORD_OAUTH_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        query = ""
+        nav_start = time.time()
+        while time.time() - nav_start < 90:
+            url = page.url or ""
+            if 'discord.com' in url:
+                query = _extract_authorize_query(url)
+                if query:
+                    break
+            elif 'dash.hidencloud.com' in url:
+                if '/oauth/' in url:
+                    handle_cloudflare(page, timeout=60)
+                elif '/auth/login' in url:
+                    if time.time() - nav_start > 10:
+                        log(f"⚠️ OAuth 跳转被站点重定向回登录页: {url}")
+                        break
+                elif _is_logged_in(page, strict=True):
+                    log("✅ 检测到 Discord 已授权会话，直接登录成功")
+                    return True
+                else:
+                    handle_cloudflare(page, timeout=60)
+            time.sleep(1)
+
+        if not query:
+            log("❌ 未能获取 Discord OAuth 授权参数（state）")
+            page.screenshot(path="discord_oauth_fail.png")
+            return False
+        log(f"🔗 已获取 Discord 授权参数: {re.sub(r'state=[^&]+', 'state=***', query)[:120]}")
+
+        log("🔐 使用 DISCORD_TOKEN 调用 Discord 授权 API...")
+        result = {}
+        for eval_try in range(3):
+            try:
+                current_query = _extract_authorize_query(page.url or "") or query
+                result = page.evaluate(DISCORD_AUTHORIZE_JS, {"query": current_query, "token": DISCORD_TOKEN}) or {}
+                break
+            except Exception as e:
+                if eval_try == 2:
+                    raise
+                log(f"⚠️ Discord 页面跳转中，重试授权请求 ({eval_try + 1}/3): {e}")
+                time.sleep(1)
+        location = result.get("location", "")
+        status = result.get("status", 0)
+        detail = result.get("message", "")
+        if status != 200 or not location:
+            suffix = f" ({detail})" if detail else ""
+            log(f"❌ Discord 授权失败 (HTTP {status}){suffix}，Token 可能已失效")
+            page.screenshot(path="discord_auth_fail.png")
+            return False
+        log(f"✅ 拿到授权回调: {re.sub(r'code=[^&]+', 'code=***', location)}")
+
+        page.goto(location, wait_until="domcontentloaded", timeout=60000)
+        handle_cloudflare(page, timeout=120)
+        time.sleep(2)
+        handle_cloudflare(page, timeout=60)
+        if _is_logged_in(page, strict=True):
+            log("✅ Discord OAuth 登录成功！已进入控制台")
+            return True
+        log(f"❌ Discord OAuth 回调后未能进入控制台，当前URL: {page.url}")
+        page.screenshot(path="discord_login_fail.png")
+        return False
+    except Exception as e:
+        log(f"❌ Discord OAuth 登录异常: {e}")
+        page.screenshot(path="discord_login_error.png")
+        return False
+
+def login(page):
+    if not DISCORD_TOKEN:
+        log("❌ 未配置 DISCORD_TOKEN，无法登录（站点已强制Discord登录）")
+        return False
+    if discord_login(page):
+        return True
+    log("❌ Discord OAuth 登录失败。")
+    status = "❌ 登录失败（Discord OAuth，请检查 DISCORD_TOKEN 是否有效）"
+    send_telegram_notification(status)
+    page.screenshot(path="login_fail.png")
+    return False
 
 def get_server_id(page):
     try:
@@ -549,86 +608,143 @@ def get_due_date(page):
     return "未知"
 
 def renew_service(page):
-
     try:
         log("➡ 进入续期流程...")
-        if page.url != SERVICE_URL:
-            page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
-        handle_cloudflare(page)
-        time.sleep(12) # 等待续期页面完全加载,未完全加载无法点击
-        log("🖱️ 准备点击 Renew 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
-        modal_opened = False
-        for i in range(6):
-            try:
-                renew_btn.wait_for(state="visible", timeout=10000)
-                renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
-                renew_btn.click()
-                time.sleep(3) # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME" 
-
-                log("🖲️ 等待弹窗出现...")
+        for renew_round in range(3):
+            if renew_round > 0:
+                log(f"🔄 开始第 {renew_round + 1} 轮续期重试...")
+            if page.url != SERVICE_URL or "/auth/login" in (page.url or ""):
+                page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+            handle_cloudflare(page)
+            if "/auth/login" in (page.url or ""):
+                log("⚠️ 访问服务页面被重定向到登录页，使用 Discord OAuth 重新登录...")
+                if not discord_login(page):
+                    log("❌ Discord 重新登录失败，续期中止。")
+                    page.screenshot(path="renew_relogin_failed.png")
+                    return False
+                continue
+            time.sleep(12)  # Wait for manage page scripts to finish initializing
+            log("🖱️ 准备点击 Renew 按钮...")
+            renew_btn = page.locator('button:has-text("Renew")')
+            create_btn = page.locator('button:has-text("Create Invoice")')
+            modal_opened = False
+            kicked_during_renew = False
+            for i in range(6):
                 try:
-                    create_btn.wait_for(state="visible", timeout=8000)
-                    modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
-                    break
-                except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
-            except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
+                    if "/auth/login" in (page.url or ""):
+                        kicked_during_renew = True
+                        break
+                    renew_btn.wait_for(state="visible", timeout=10000)
+                    renew_btn.scroll_into_view_if_needed()
+                    log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
+                    renew_btn.click()
+                    time.sleep(3)
+                    if "/auth/login" in (page.url or ""):
+                        kicked_during_renew = True
+                        break
+                    page_text = page.locator("body").inner_text()
+                    if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                        log("⚠️ 未到续期时间，无法续期。")
+                        page.screenshot(path="renew_not_allowed.png")
+                        return "NOT_TIME"
 
-        if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
-            page.screenshot(path="renew_modal_failed.png")
-            return False
+                    log("🖲️ 等待弹窗出现...")
+                    try:
+                        create_btn.wait_for(state="visible", timeout=8000)
+                        modal_opened = True
+                        log("✅ 弹窗已成功弹出！")
+                        break
+                    except Exception:
+                        if "/auth/login" in (page.url or ""):
+                            kicked_during_renew = True
+                            break
+                        log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
+                        time.sleep(2)
+                except Exception as e:
+                    if "/auth/login" in (page.url or ""):
+                        kicked_during_renew = True
+                        break
+                    log(f"❌ 点击尝试出错: {e}")
 
-        # 弹窗内先完成 Turnstile 人机验证，再提交
-        handle_cloudflare(page, timeout=60)
-        if not solve_modal_turnstile(page, timeout=90):
-            log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
-            page.screenshot(path="turnstile_timeout.png")
-
-        # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
-        new_invoice_url = None
-        time.sleep(2)
-        for attempt in range(6):
-            log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
-            try:
-                create_btn.wait_for(state="visible", timeout=30000)
-                create_btn.click(timeout=20000)
-            except Exception as e:
-                log(f"⚠️ 点击 Create Invoice 失败: {e}")
-                solve_modal_turnstile(page, timeout=45)
-                time.sleep(2)
+            if kicked_during_renew:
+                log("🔑 续期操作被跳回登录页，使用 Discord OAuth 重新登录...")
+                if not discord_login(page):
+                    log("❌ Discord 重新登录失败，续期中止。")
+                    page.screenshot(path="renew_relogin_failed.png")
+                    return False
                 continue
 
-            start_wait = time.time()
-            while time.time() - start_wait < 30:
-                if "/payment/invoice/" in page.url:
-                    new_invoice_url = page.url
-                    log(f"🎉 页面已跳转: {new_invoice_url}")
+            if not modal_opened:
+                log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+                page.screenshot(path="renew_modal_failed.png")
+                return False
+
+            handle_cloudflare(page, timeout=60)
+            if not solve_modal_turnstile(page, timeout=90):
+                log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
+                page.screenshot(path="turnstile_timeout.png")
+
+            new_invoice_url = None
+            kicked_to_login = False
+            time.sleep(2)
+            for attempt in range(6):
+                if "/auth/login" in (page.url or ""):
+                    kicked_to_login = True
+                    log(f"⚠️ 页面已跳回登录页: {page.url}")
                     break
-                # 出现整页 Cloudflare 拦截/安全验证页时先处理（弹窗内的 Turnstile 组件交给 solve_modal_turnstile）
-                if _has_interstitial_iframe(page) or _is_security_check_page(page):
-                    log("⚠️ 遇到整页拦截，尝试处理...")
-                    handle_cloudflare(page, timeout=60)
-                time.sleep(1)
+                log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
+                try:
+                    create_btn.wait_for(state="visible", timeout=30000)
+                    create_btn.click(timeout=20000)
+                except Exception as e:
+                    if "/auth/login" in (page.url or ""):
+                        kicked_to_login = True
+                        log(f"⚠️ 点击 Create Invoice 时页面已跳回登录页: {page.url}")
+                        break
+                    log(f"⚠️ 点击 Create Invoice 失败: {e}")
+                    solve_modal_turnstile(page, timeout=45)
+                    time.sleep(2)
+                    continue
+
+                start_wait = time.time()
+                while time.time() - start_wait < 30:
+                    if "/payment/invoice/" in page.url:
+                        new_invoice_url = page.url
+                        log(f"🎉 页面已跳转: {new_invoice_url}")
+                        break
+                    if "/auth/login" in (page.url or ""):
+                        kicked_to_login = True
+                        log(f"⚠️ 点击 Create Invoice 后页面跳回登录页: {page.url}")
+                        break
+                    if _has_interstitial_iframe(page) or _is_security_check_page(page):
+                        log("⚠️ 遇到整页拦截，尝试处理...")
+                        handle_cloudflare(page, timeout=60)
+                    time.sleep(1)
+                if new_invoice_url or kicked_to_login:
+                    break
+
+                log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
+                solve_modal_turnstile(page, timeout=45)
+
             if new_invoice_url:
                 break
 
-            log("⚠️ 未跳转到发票页面，尝试重新完成 Turnstile 验证后重试...")
-            solve_modal_turnstile(page, timeout=45)
+            if kicked_to_login:
+                if renew_round == 2:
+                    break
+                log("🔑 使用 Discord OAuth 重新登录后重试续期...")
+                if not discord_login(page):
+                    log("❌ Discord 重新登录失败，续期中止。")
+                    page.screenshot(path="renew_relogin_failed.png")
+                    return False
+                continue
+
+            log("❌ 未能进入发票页面，超时。")
+            page.screenshot(path="renew_stuck_invoice.png")
+            return False
 
         if not new_invoice_url:
-            log("❌ 未能进入发票页面，超时。")
+            log("❌ 多轮重试后仍未完成续期。")
             page.screenshot(path="renew_stuck_invoice.png")
             return False
 
@@ -641,8 +757,8 @@ def renew_service(page):
         pay_btn.wait_for(state="visible", timeout=30000)
         pay_btn.click()
         log("✅ Pay 按钮已点击")
-        time.sleep(6) # 等待支付确认页面或跳转回服务页
-        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000) # 返回服务管理页面以获取新的到期时间
+        time.sleep(6)
+        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
 
@@ -652,11 +768,10 @@ def renew_service(page):
         return False
 
 def main():
-    # 检查必要环境变量
-    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
-        f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
-        log("❌ 缺少登录凭证")
+    log(f"🔍 凭证检测: DISCORD_TOKEN={'已配置' if DISCORD_TOKEN else '未配置'}, "
+        f"EMAIL={'已配置' if EMAIL else '未配置'}（仅TG通知用）")
+    if not DISCORD_TOKEN:
+        log("❌ 缺少 DISCORD_TOKEN，无法登录（站点已强制Discord登录）")
         sys.exit(1)
 
     global SERVICE_URL
